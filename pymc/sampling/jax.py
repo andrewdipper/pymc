@@ -291,99 +291,16 @@ def _blackjax_inference_loop(
     return samples, stats
 
 
-def _blackjax_inference_loop_dup2(
-    seed, init_position, logprob_fn, draws, tune, target_accept, postprocess_fn, nchunk, **adaptation_kwargs
-):
-    import blackjax
-
-    assert draws % nchunk == 0
-    nsteps = draws // nchunk
-
-    algorithm_name = adaptation_kwargs.pop("algorithm", "nuts")
-    if algorithm_name == "nuts":
-        algorithm = blackjax.nuts
-    elif algorithm_name == "hmc":
-        algorithm = blackjax.hmc
-    else:
-        raise ValueError("Only supporting 'nuts' or 'hmc' as algorithm to draw samples.")
-
-    adapt = blackjax.window_adaptation(
-        algorithm=algorithm,
-        logdensity_fn=logprob_fn,
-        target_acceptance_rate=target_accept,
-        **adaptation_kwargs,
-    )
-    (last_state, tuned_params), _ = adapt.run(seed, init_position, num_steps=tune)
-    kernel = algorithm(logprob_fn, **tuned_params).step
-
-    def getshape(inp):
-        ishape = inp.shape
-        if ishape == ():
-            return (nsteps,)
-        return (nsteps, *ishape)
-
-    base_shapes = [getshape(arr) for arr in last_state.position]
-    output_arrays = [jnp.zeros(shp, device=jax.devices("cpu")[0]) for shp in base_shapes]
-    output_stats = {
-            "diverging": jnp.zeros((draws,), device=jax.devices("cpu")[0], dtype=jnp.bool),
-            "energy": jnp.zeros((draws,), device=jax.devices("cpu")[0]),
-            "tree_depth": jnp.zeros((draws,), device=jax.devices("cpu")[0], dtype=jnp.int32),
-            "n_steps": jnp.zeros((draws,), device=jax.devices("cpu")[0], dtype=jnp.int32),
-            "acceptance_rate": jnp.zeros((draws,), device=jax.devices("cpu")[0]),
-            "lp": jnp.zeros((draws,), device=jax.devices("cpu")[0]),
-        }
-
-    @partial(jax.jit, donate_argnums=0)
-    def set_tree(store, input, idx):
-        def update_fn(sarr, iarr):
-            starts = (idx, *([0]*(len(sarr.shape) - 1)))
-            return jax.lax.dynamic_update_slice(sarr, iarr, starts)
-        store = jax.tree.map(update_fn, store, input)
-        return store
-    
-
-    def _one_step(state, rng_key):
-        state, info = kernel(rng_key, state)
-        position = state.position
-        stats = {
-            "diverging": info.is_divergent,
-            "energy": info.energy,
-            "tree_depth": info.num_trajectory_expansions,
-            "n_steps": info.num_integration_steps,
-            "acceptance_rate": info.acceptance_rate,
-            "lp": state.logdensity,
-        }
-        return state, (position, stats)
-
-    def _multi_step(start_state, key):
-        keys = jax.random.split(key, nsteps)
-        last_state, (samples, stats) = jax.lax.scan(_one_step, start_state, keys)
-        return last_state, (samples, stats)
-
-    use_progress_bar = adaptation_kwargs.pop("progress_bar", False)
-    use_progress_bar = True  #TODO remove
-    loopiter = range(nchunk)
-    if use_progress_bar:
-        loopiter = progress_bar(loopiter)
-
-    multi_step = jax.jit(_multi_step)  
-    keys = jax.random.split(seed, nchunk)
-    for i in loopiter:
-        last_state, (samples, stats) = multi_step(last_state, keys[i]) 
-        output_arrays = set_tree(output_arrays, samples, nsteps*i)
-        output_stats = set_tree(output_stats, stats, nsteps*i)
-
-    return output_arrays, output_stats
-
-
 
 def _blackjax_inference_loop_dup3(
-    seed, init_position, logprob_fn, draws, tune, target_accept, postprocess_fn, nchunk, **adaptation_kwargs
+    seed, init_position, logprob_fn, draws, tune, target_accept, num_chunks=1, **adaptation_kwargs
 ):
     import blackjax
 
+    nchunk = num_chunks #adaptation_kwargs.pop('num_chunks', 1)
     assert draws % nchunk == 0
     nsteps = draws // nchunk
+
 
     algorithm_name = adaptation_kwargs.pop("algorithm", "nuts")
     if algorithm_name == "nuts":
@@ -558,30 +475,16 @@ def _sample_blackjax_nuts(
     keys = jax.random.split(seed, chains)
 
     nuts_kwargs["progress_bar"] = progressbar
-#    get_posterior_samples = partial(
-#        #_blackjax_inference_loop_dup,
-#        #_blackjax_inference_loop,
-#        logprob_fn=logprob_fn,
-#        tune=tune,
-#        draws=draws,
-#        target_accept=target_accept,
-#        adaptation_info_fn=get_filter_adapt_info_fn(),
-#        **nuts_kwargs,
-#    )
-
     get_posterior_samples = partial(
         _blackjax_inference_loop_dup3,
+        #_blackjax_inference_loop,
         logprob_fn=logprob_fn,
         tune=tune,
         draws=draws,
         target_accept=target_accept,
         adaptation_info_fn=get_filter_adapt_info_fn(),
-        postprocess_fn=None,
-        nchunk=200,
         **nuts_kwargs,
     )
-
-    #raw_mcmc_samples, sample_stats = get_posterior_samples(keys, initial_points)
 
     raw_mcmc_samples, sample_stats = map_fn(get_posterior_samples)(keys, initial_points)
     return raw_mcmc_samples, sample_stats, blackjax
