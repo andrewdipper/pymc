@@ -164,6 +164,14 @@ def get_jaxified_logp(model: Model, negative_logp=True) -> Callable:
     return logp_fn_wrap
 
 
+def _get_log_likelihood(model: Model, samples) -> dict:
+    """Compute log-likelihood for all observations"""
+    elemwise_logp = model.logp(model.observed_RVs, sum=False)
+    jax_fn = get_jaxified_graph(inputs=model.value_vars, outputs=elemwise_logp)
+    result = jax.vmap(jax_fn)(*samples)
+    return {v.name: r for v, r in zip(model.observed_RVs, result)}
+
+
 def _device_put(input, device: str):
     return jax.device_put(input, jax.devices(device)[0])
 
@@ -228,7 +236,7 @@ def _blackjax_inference_loop(
     # Setup sharding
     total_devices = len(jax.devices())
     ndevice = jnp.gcd(chains, total_devices)
-    if ndevice < total_devices:
+    if ndevice < total_devices and ndevice != chains:
         warnings.warn(
             f"Only using {ndevice} devices. GCD of devices={total_devices} and chains={chains} is {ndevice}",
             UserWarning,
@@ -554,7 +562,9 @@ def _sample_numpyro_nuts(
 
     raw_mcmc_samples = pmap_numpyro.get_samples(group_by_chain=True)
     sample_stats = _numpyro_stats_to_dict(pmap_numpyro)
-    mcmc_samples, likelihoods = jax.jit(jax.vmap(postprocess_fn), donate_argnums=0)(
+    print(raw_mcmc_samples)
+    #mcmc_samples, likelihoods = jax.jit(jax.vmap(postprocess_fn), donate_argnums=0)(
+    mcmc_samples, likelihoods = jax.vmap(postprocess_fn)(
         raw_mcmc_samples
     )
     return mcmc_samples, sample_stats, likelihoods, numpyro
@@ -669,6 +679,7 @@ def sample_jax_nuts(
         postprocessing_vectorize = "vmap"
 
     model = modelcontext(model)
+    model = pm.model.tra
 
     if var_names is not None:
         filtered_var_names = [v for v in model.unobserved_value_vars if v.name in var_names]
@@ -681,10 +692,7 @@ def sample_jax_nuts(
     def postprocess_base_fn(samples, transform, likelihood):
         mcmc_samples, likelihoods = None, None
         if likelihood:
-            elemwise_logp = model.logp(model.observed_RVs, sum=False)
-            jax_fn = get_jaxified_graph(inputs=model.value_vars, outputs=elemwise_logp)
-            result = jax.vmap(jax_fn)(*samples)
-            likelihoods = {v.name: r for v, r in zip(model.observed_RVs, result)}
+            likelihoods = _get_log_likelihood(model, samples)
         if transform:
             jax_fn = get_jaxified_graph(inputs=model.value_vars, outputs=vars_to_sample)
             result = jax.vmap(jax_fn)(*samples)

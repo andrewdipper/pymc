@@ -228,7 +228,7 @@ def test_get_log_likelihood():
     b_true = trace.log_likelihood.b.values
     a = np.array(trace.posterior.a)
     sigma_log_ = np.log(np.array(trace.posterior.sigma))
-    b_jax = _get_log_likelihood(model, [a, sigma_log_])["b"]
+    b_jax = jax.vmap(_get_log_likelihood, in_axes=(None, 0))(model, [a, sigma_log_])["b"]
 
     assert np.allclose(b_jax.reshape(-1), b_true.reshape(-1))
 
@@ -485,9 +485,14 @@ def test_sample_partially_observed():
             x = pm.Normal("x", observed=np.array([0, 1, np.nan]))
         idata = pm.sample(nuts_sampler="numpyro", chains=1, draws=10, tune=10)
 
+    print(idata)
+    print(idata.observed_data["x_observed"])
+    print(idata.posterior["x_unobserved"])
+    print(idata.posterior["x"])
     assert idata.observed_data["x_observed"].shape == (2,)
     assert idata.posterior["x_unobserved"].shape == (1, 10, 1)
     assert idata.posterior["x"].shape == (1, 10, 3)
+    raise
 
 
 def test_sample_var_names():
