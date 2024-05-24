@@ -164,12 +164,14 @@ def get_jaxified_logp(model: Model, negative_logp=True) -> Callable:
     return logp_fn_wrap
 
 
-def _get_log_likelihood(model: Model, samples) -> dict:
+def _get_log_likelihood_fn(model: Model) -> Callable:
     """Compute log-likelihood for all observations"""
     elemwise_logp = model.logp(model.observed_RVs, sum=False)
     jax_fn = get_jaxified_graph(inputs=model.value_vars, outputs=elemwise_logp)
-    result = jax.vmap(jax_fn)(*samples)
-    return {v.name: r for v, r in zip(model.observed_RVs, result)}
+    def log_likelihood_fn(samples):
+        result = jax.vmap(jax_fn)(*samples)
+        return {v.name: r for v, r in zip(model.observed_RVs, result)}
+    return log_likelihood_fn
 
 
 def _device_put(input, device: str):
@@ -562,9 +564,7 @@ def _sample_numpyro_nuts(
 
     raw_mcmc_samples = pmap_numpyro.get_samples(group_by_chain=True)
     sample_stats = _numpyro_stats_to_dict(pmap_numpyro)
-    print(raw_mcmc_samples)
-    #mcmc_samples, likelihoods = jax.jit(jax.vmap(postprocess_fn), donate_argnums=0)(
-    mcmc_samples, likelihoods = jax.vmap(postprocess_fn)(
+    mcmc_samples, likelihoods = jax.jit(jax.vmap(postprocess_fn), donate_argnums=0)(
         raw_mcmc_samples
     )
     return mcmc_samples, sample_stats, likelihoods, numpyro
@@ -679,7 +679,6 @@ def sample_jax_nuts(
         postprocessing_vectorize = "vmap"
 
     model = modelcontext(model)
-    model = pm.model.tra
 
     if var_names is not None:
         filtered_var_names = [v for v in model.unobserved_value_vars if v.name in var_names]
@@ -689,13 +688,22 @@ def sample_jax_nuts(
     nuts_kwargs = {} if nuts_kwargs is None else nuts_kwargs.copy()
     idata_kwargs = {} if idata_kwargs is None else idata_kwargs.copy()
 
+    vars_to_sample = list(
+        get_default_varnames(filtered_var_names, include_transformed=keep_untransformed)
+    )
+
+    log_likelihood_fn = _get_log_likelihood_fn(model)
+    transform_jax_fn = get_jaxified_graph(inputs=model.value_vars, outputs=vars_to_sample)
+
     def postprocess_base_fn(samples, transform, likelihood):
         mcmc_samples, likelihoods = None, None
         if likelihood:
-            likelihoods = _get_log_likelihood(model, samples)
+            #result = jax.vmap(likelihood_jax_fn)(*samples)
+            #likelihoods = {v.name: r for v, r in zip(model.observed_RVs, result)}
+            likelihoods = log_likelihood_fn(samples)
         if transform:
-            jax_fn = get_jaxified_graph(inputs=model.value_vars, outputs=vars_to_sample)
-            result = jax.vmap(jax_fn)(*samples)
+            #jax_fn = get_jaxified_graph(inputs=model.value_vars, outputs=vars_to_sample)
+            result = jax.vmap(transform_jax_fn)(*samples)
             mcmc_samples = {v.name: r for v, r in zip(vars_to_sample, result)}
         return mcmc_samples, likelihoods
 
@@ -703,9 +711,6 @@ def sample_jax_nuts(
         postprocess_base_fn, transform=True, likelihood=idata_kwargs.pop("log_likelihood", False)
     )
 
-    vars_to_sample = list(
-        get_default_varnames(filtered_var_names, include_transformed=keep_untransformed)
-    )
 
     (random_seed,) = _get_seeds_per_chain(random_seed, 1)
 
