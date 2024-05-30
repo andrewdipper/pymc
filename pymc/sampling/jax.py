@@ -328,7 +328,7 @@ def _blackjax_inference_loop(
     last_state, (samples, stats) = multi_step(
         last_state, keys[:, 0, :], tuned_params["inverse_mass_matrix"], tuned_params["step_size"]
     )
-    print('done sampling {time.time() - stime}')
+    print(f'done sampling {time.time() - stime}')
     if nchunk == 1:
         return samples[0], stats, samples[1]
 
