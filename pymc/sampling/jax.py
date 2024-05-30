@@ -243,7 +243,8 @@ def _blackjax_inference_loop(
             f"Only using {ndevice} devices. GCD of devices={total_devices} and chains={chains} is {ndevice}",
             UserWarning,
         )
-    if ndevice == 1 and chain_method != "vmap":
+    print(f'using {ndevice} of {total_devices} devices')
+    if ndevice == 1 and chain_method != "vectorized":
         warnings.warn("Disabling shard_map since devices used=1")
         chain_method = "vectorized"
 
@@ -698,11 +699,8 @@ def sample_jax_nuts(
     def postprocess_base_fn(samples, transform, likelihood):
         mcmc_samples, likelihoods = None, None
         if likelihood:
-            #result = jax.vmap(likelihood_jax_fn)(*samples)
-            #likelihoods = {v.name: r for v, r in zip(model.observed_RVs, result)}
             likelihoods = log_likelihood_fn(samples)
         if transform:
-            #jax_fn = get_jaxified_graph(inputs=model.value_vars, outputs=vars_to_sample)
             result = jax.vmap(transform_jax_fn)(*samples)
             mcmc_samples = {v.name: r for v, r in zip(vars_to_sample, result)}
         return mcmc_samples, likelihoods
