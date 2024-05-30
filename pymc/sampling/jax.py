@@ -339,7 +339,7 @@ def _blackjax_inference_loop(
     if nchunk == 1:
         timestats['sampling'] = time.time() - stime
         print(f'done sampling', timestats)
-        return samples[0], stats, samples[1]
+        return samples[0], stats, samples[1], timestats
 
     # setup + run remaining sample chunks
     use_progress_bar = adaptation_kwargs.pop("progress_bar", False)
