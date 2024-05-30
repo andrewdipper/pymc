@@ -337,7 +337,7 @@ def _blackjax_inference_loop(
     )
 
     if nchunk == 1:
-        timestats['sampling'] = time.time - stime()
+        timestats['sampling'] = time.time() - stime
         print(f'done sampling', timestats)
         return samples[0], stats, samples[1]
 
@@ -382,7 +382,7 @@ def _blackjax_inference_loop(
             output_stats, jax.device_put(stats, jax.devices("cpu")[0]), nsteps * i
         )
     
-    timestats['sampling'] = time.time - stime()
+    timestats['sampling'] = time.time() - stime
     print(f'done sampling', timestats)
     return (output_arrays[0], output_stats, output_arrays[1]), timestats
 
