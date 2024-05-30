@@ -280,7 +280,9 @@ def _blackjax_inference_loop(
     def run_adaptation(seed, init_position):
         return adapt.run(seed, init_position, num_steps=tune)
 
+    print('running_adaptation')
     (last_state, tuned_params), _ = run_adaptation(seed, init_position)
+    print('done')
 
     # Setup + run first sample chunk
     def _one_step(state, rng_key, imm, ss):
@@ -317,6 +319,7 @@ def _blackjax_inference_loop(
         samples, log_likelihoods = postprocess_fn(raw_samples)
         return last_state, ((samples, log_likelihoods), stats)
 
+    print('sampling')
     keys = jax.vmap(jax.random.split, in_axes=(0, None))(seed, nchunk)
     last_state, (samples, stats) = multi_step(
         last_state, keys[:, 0, :], tuned_params["inverse_mass_matrix"], tuned_params["step_size"]
