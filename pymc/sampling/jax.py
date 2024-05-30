@@ -267,6 +267,7 @@ def _blackjax_inference_loop(
         **adaptation_kwargs,
     )
 
+    @jax.jit
     @shardswitch(
         partial(
             shard_map,
@@ -300,6 +301,7 @@ def _blackjax_inference_loop(
         }
         return state, (position, stats)
 
+    @jax.jit
     @shardswitch(
         partial(
             shard_map,
@@ -309,7 +311,6 @@ def _blackjax_inference_loop(
             check_rep=False,
         )
     )
-    @jax.jit
     @jax.vmap
     def multi_step(start_state, key, imm, ss):
         keys = jax.random.split(key, nsteps)
@@ -324,7 +325,7 @@ def _blackjax_inference_loop(
     last_state, (samples, stats) = multi_step(
         last_state, keys[:, 0, :], tuned_params["inverse_mass_matrix"], tuned_params["step_size"]
     )
-
+    print('done sampling')
     if nchunk == 1:
         return samples[0], stats, samples[1]
 
