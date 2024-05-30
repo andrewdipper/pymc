@@ -384,7 +384,7 @@ def _blackjax_inference_loop(
     
     timestats['sampling'] = time.time() - stime
     print(f'done sampling', timestats)
-    return (output_arrays[0], output_stats, output_arrays[1]), timestats
+    return (output_arrays[0], output_stats, output_arrays[1], timestats)
 
 
 def _sample_blackjax_nuts(
