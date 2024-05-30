@@ -221,6 +221,9 @@ def _blackjax_inference_loop(
     num_chunks=1,
     **adaptation_kwargs,
 ):
+    import time
+    timestats = {}
+    stime = time.time()
     import blackjax
 
     nchunk = num_chunks
@@ -281,11 +284,13 @@ def _blackjax_inference_loop(
     def run_adaptation(seed, init_position):
         return adapt.run(seed, init_position, num_steps=tune)
 
-    import time
+    timestats['setup'] = time.time() - stime
     stime = time.time()
-    print('running_adaptation')
+    print('running_adaptation', timestats)
     (last_state, tuned_params), _ = run_adaptation(seed, init_position)
-    print(f'done {time.time() - stime}')
+    timestats['adaptation'] = time.time() - stime
+    stime = time.time()
+    print('done', timestats)
 
     # Setup + run first sample chunk
     def _one_step(state, rng_key, imm, ss):
@@ -322,14 +327,18 @@ def _blackjax_inference_loop(
         samples, log_likelihoods = postprocess_fn(raw_samples)
         return last_state, ((samples, log_likelihoods), stats)
 
-    print('sampling')
+    timestats['sampling_setup'] = time.time() - stime
+    stime = time.time()
+    print('sampling', timestats)
     stime = time.time()
     keys = jax.vmap(jax.random.split, in_axes=(0, None))(seed, nchunk)
     last_state, (samples, stats) = multi_step(
         last_state, keys[:, 0, :], tuned_params["inverse_mass_matrix"], tuned_params["step_size"]
     )
-    print(f'done sampling {time.time() - stime}')
+
     if nchunk == 1:
+        timestats['sampling'] = time.time - stime()
+        print(f'done sampling', timestats)
         return samples[0], stats, samples[1]
 
     # setup + run remaining sample chunks
@@ -372,8 +381,10 @@ def _blackjax_inference_loop(
         output_stats = set_tree(
             output_stats, jax.device_put(stats, jax.devices("cpu")[0]), nsteps * i
         )
-
-    return (output_arrays[0], output_stats, output_arrays[1])
+    
+    timestats['sampling'] = time.time - stime()
+    print(f'done sampling', timestats)
+    return (output_arrays[0], output_stats, output_arrays[1]), timestats
 
 
 def _sample_blackjax_nuts(
@@ -488,9 +499,9 @@ def _sample_blackjax_nuts(
         **nuts_kwargs,
     )
 
-    mcmc_samples, sample_stats, log_likelihoods = get_posterior_samples(keys, initial_points)
+    mcmc_samples, sample_stats, log_likelihoods, timestats = get_posterior_samples(keys, initial_points)
 
-    return mcmc_samples, sample_stats, log_likelihoods, blackjax
+    return mcmc_samples, sample_stats, log_likelihoods, blackjax, timestats
 
 
 # Adopted from arviz numpyro extractor
@@ -735,7 +746,7 @@ def sample_jax_nuts(
         raise ValueError(f"{nuts_sampler=} not recognized")
 
     tic1 = datetime.now()
-    mcmc_samples, sample_stats, log_likelihood, library = sampler_fn(
+    mcmc_samples, sample_stats, log_likelihood, library, timestats = sampler_fn(
         model=model,
         target_accept=target_accept,
         tune=tune,
@@ -778,7 +789,7 @@ def sample_jax_nuts(
         warns = run_convergence_checks(az_trace, model)
         log_warnings(warns)
 
-    return az_trace
+    return az_trace, timestats
 
 
 sample_numpyro_nuts = partial(sample_jax_nuts, nuts_sampler="numpyro")
