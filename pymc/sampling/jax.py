@@ -247,9 +247,6 @@ def _blackjax_inference_loop(
     num_chunks=1,
     **adaptation_kwargs,
 ):
-    import time
-    timestats = {}
-    stime = time.time()
     import blackjax
     from fastprogress.fastprogress import progress_bar
 
@@ -313,14 +310,7 @@ def _blackjax_inference_loop(
     @jax.vmap
     def run_adaptation(seed, init_position):
         return adapt.run(seed, init_position, num_steps=tune)
-
-    timestats['setup'] = time.time() - stime
-    stime = time.time()
-    print('running_adaptation', timestats)
     (last_state, tuned_params), _ = run_adaptation(seed, init_position)
-    timestats['adaptation'] = time.time() - stime
-    stime = time.time()
-    print('done', timestats)
 
     # Setup + run first sample chunk
     def _one_step(state, rng_key, imm, ss):
@@ -357,19 +347,13 @@ def _blackjax_inference_loop(
         samples, log_likelihoods = postprocess_fn(raw_samples)
         return last_state, ((samples, log_likelihoods), stats)
 
-    timestats['sampling_setup'] = time.time() - stime
-    stime = time.time()
-    print('sampling', timestats)
-    stime = time.time()
     keys = jax.vmap(jax.random.split, in_axes=(0, None))(seed, nchunk)
     last_state, (samples, stats) = multi_step(
         last_state, keys[:, 0, :], tuned_params["inverse_mass_matrix"], tuned_params["step_size"]
     )
 
     if nchunk == 1:
-        timestats['sampling'] = time.time() - stime
-        print(f'done sampling', timestats)
-        return samples[0], stats, samples[1], timestats
+        return samples[0], stats, samples[1]
 
     # setup + run remaining sample chunks
     use_progress_bar = adaptation_kwargs.pop("progress_bar", False)
@@ -412,9 +396,7 @@ def _blackjax_inference_loop(
             output_stats, jax.device_put(stats, jax.devices("cpu")[0]), nsteps * i
         )
 
-    timestats['sampling'] = time.time() - stime
-    print(f'done sampling', timestats)
-    return (output_arrays[0], output_stats, output_arrays[1], timestats)
+    return (output_arrays[0], output_stats, output_arrays[1])
 
 
 def _sample_blackjax_nuts(
@@ -522,16 +504,14 @@ def _sample_blackjax_nuts(
         tune=tune,
         draws=draws,
         target_accept=target_accept,
-        adaptation_info_fn=get_filter_adapt_info_fn(),
         chains=chains,
         chain_method=chain_method,
         postprocess_fn=postprocess_fn,
         **nuts_kwargs,
     )
 
-    mcmc_samples, sample_stats, log_likelihoods, timestats = get_posterior_samples(keys, initial_points)
+    mcmc_samples, sample_stats, log_likelihoods = get_posterior_samples(keys, initial_points)
     return mcmc_samples, sample_stats, log_likelihoods, blackjax
-    #return mcmc_samples, sample_stats, log_likelihoods, blackjax, timestats
 
 # Adopted from arviz numpyro extractor
 def _numpyro_stats_to_dict(posterior):
@@ -566,10 +546,26 @@ def _sample_numpyro_nuts(
     initial_points,
     postprocess_fn,
     nuts_kwargs: dict[str, Any],
+    num_chunks=1,
 ):
     import numpyro
-
     from numpyro.infer import MCMC, NUTS
+
+    nchunk = num_chunks
+    assert draws % nchunk == 0
+    nsteps = draws // nchunk
+
+    # Setup sharding
+    total_devices = len(jax.devices())
+    ndevice = jnp.gcd(chains, total_devices)
+    if ndevice < total_devices and ndevice != chains:
+        warnings.warn(
+            f"Only using {ndevice} devices. GCD of devices={total_devices} and chains={chains} is {ndevice}",
+            UserWarning,
+        )
+    if ndevice == 1 and chain_method != "vectorized":
+        warnings.warn("Disabling shard_map since devices used=1")
+        chain_method = "vectorized"
 
     logp_fn = get_jaxified_logp(model, negative_logp=False)
 
@@ -785,7 +781,7 @@ def sample_jax_nuts(
         progressbar=progressbar,
         random_seed=random_seed,
         initial_points=initial_points,
-	postprocess_fn=postprocess_fn,
+	    postprocess_fn=postprocess_fn,
         nuts_kwargs=nuts_kwargs,
     )
     tic2 = datetime.now()
