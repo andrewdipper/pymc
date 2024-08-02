@@ -456,9 +456,8 @@ def _sample_numpyro_nuts(
     import numpyro
     from numpyro.infer import MCMC, NUTS
 
-    nchunk = num_chunks
-    assert draws % nchunk == 0
-    nsteps = draws // nchunk
+    assert draws % num_chunks == 0
+    nsteps = draws // num_chunks
 
     logp_fn = get_jaxified_logp(model, negative_logp=False)
 
@@ -482,45 +481,47 @@ def _sample_numpyro_nuts(
         progress_bar=progressbar,
     )
 
-    map_seed = jax.random.PRNGKey(random_seed)
-    if chains > 1:
-        map_seed = jax.random.split(map_seed, chains)
+    key = jax.random.PRNGKey(random_seed)
+    key, _skey = jax.random.split(key)
+
+    extra_fields = (
+            "num_steps",
+            "potential_energy",
+            "energy",
+            "adapt_state.step_size",
+            "accept_prob",
+            "diverging",
+        )
+
+    #TODO need some of this under jit???
+    pmap_numpyro.run(_skey, init_params=initial_points, extra_fields=extra_fields)
+    raw_mcmc_samples = pmap_numpyro.get_samples(group_by_chain=True)
+    stats = _numpyro_stats_to_dict(pmap_numpyro)
+    samples = jax.vmap(postprocess_fn)(raw_mcmc_samples)
+    last_state = pmap_numpyro.last_state
+
+    if num_chunks == 1:
+        return samples[0], stats, samples[1], numpyro
 
 
     #TODO fix random stuff
-    def sample_chunk(key):
+    @jax.jit
+    def sample_chunk(state):
+        last_state, key = state
+        pmap_numpyro.post_warmup_state = last_state
         key, _skey = jax.random.split(key)
-        pmap_numpyro.run(
-            _skey,
-            init_params=initial_points,
-            extra_fields=(
-                "num_steps",
-                "potential_energy",
-                "energy",
-                "adapt_state.step_size",
-                "accept_prob",
-                "diverging",
-            ),
-        )
+        pmap_numpyro.run(_skey, extra_fields=extra_fields)
+
         raw_mcmc_samples = pmap_numpyro.get_samples(group_by_chain=True)
         sample_stats = _numpyro_stats_to_dict(pmap_numpyro)
-        mcmc_samples, likelihoods = jax.jit(jax.vmap(postprocess_fn), donate_argnums=0)(
+        mcmc_samples, likelihoods = jax.vmap(postprocess_fn)(
             raw_mcmc_samples
         )
         last_state = pmap_numpyro.last_state
         return (last_state, key), ((mcmc_samples, likelihoods), sample_stats)
     
-    def sample_chunk_continue(state):
-        last_state, key = state
-        pmap_numpyro.post_warmup_state = last_state
-        return sample_chunk(key)
 
-    last_state, (samples, stats) = sample_chunk(map_seed)
-
-    if nchunk == 1:
-        return samples[0], stats, samples[1], numpyro
-
-    last_state, (all_samples, all_stats) = _do_chunked_sampling(last_state, (samples, stats), num_chunks, nsteps, sample_chunk_continue)
+    last_state, (all_samples, all_stats) = _do_chunked_sampling((last_state, key), (samples, stats), num_chunks, nsteps, sample_chunk)
     return all_samples[0], all_stats, all_samples[1], numpyro
 
 
