@@ -299,7 +299,7 @@ def _blackjax_inference_loop(
     devices = mesh_utils.create_device_mesh((ndevice,), devices=jax.devices()[:ndevice])
     mesh = Mesh(devices, axis_names=("C"))
     shard_wrap_fn = partial(shard_map, mesh=mesh, out_specs=(PS("C"), PS("C")), check_rep=False)
-    def shardswitch(chain_method, wrapper):
+    def shardswitch(wrapper):
         return lambda fn: fn if chain_method == "vectorized" else wrapper(fn)
 
     # Run adaptation
@@ -312,14 +312,13 @@ def _blackjax_inference_loop(
     )
 
     @jax.jit
-    @shardswitch(chain_method, partial(shard_wrap_fn, in_specs=(PS("C"), PS("C"))))
+    @shardswitch(partial(shard_wrap_fn, in_specs=(PS("C"), PS("C"))))
     @jax.vmap
     def run_adaptation(seed, init_position):
         return adapt.run(seed, init_position, num_steps=tune)
     (last_state, tuned_params), _ = run_adaptation(seed, init_position)
 
     # Setup + run first sample chunk
-    @jax.vmap
     def _one_step(state, rng_key, imm, ss):
         state, info = algorithm(logprob_fn, inverse_mass_matrix=imm, step_size=ss).step(
             rng_key, state
@@ -336,14 +335,14 @@ def _blackjax_inference_loop(
         return state, (position, stats)
 
     @jax.jit
-    @shardswitch(chain_method, partial(shard_wrap_fn, in_specs=(PS("C"), PS("C"), PS("C"), PS("C"))))
+    @shardswitch(partial(shard_wrap_fn, in_specs=(PS("C"), PS("C"), PS("C"), PS("C"))))
     @jax.vmap
     def multi_step(start_state, key, imm, ss):
-        keys = jax.vmap(jax.random.split, in_axes=(0, None))(key, nsteps)
+        keys = jax.random.split(key, nsteps)
         last_state, (raw_samples, stats) = jax.lax.scan(
             partial(_one_step, imm=imm, ss=ss), start_state, keys
         )
-        samples, log_likelihoods = jax.vmap(postprocess_fn)(raw_samples)
+        samples, log_likelihoods = postprocess_fn(raw_samples)
         return last_state, ((samples, log_likelihoods), stats)
 
     keys = jax.vmap(jax.random.split, in_axes=(0, None))(seed, nchunk)
@@ -696,6 +695,15 @@ def sample_jax_nuts(
         warnings.warn(
             "postprocessing_chunks is deprecated due to being unstable, "
             "using postprocessing_vectorize='scan' instead",
+            DeprecationWarning,
+        )
+
+    if postprocessing_backend is not None:
+        import warnings
+
+        warnings.warn(
+            "postprocessing_backend will be removed in a future release, "
+            "postprocessing is done on sampling device.",
             DeprecationWarning,
         )
 
