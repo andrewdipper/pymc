@@ -216,11 +216,7 @@ def _gen_arr(inp, nchunk):
     return jnp.zeros(shape, dtype=inp.dtype, device=jax.devices("cpu")[0])
 
 
-def _do_chunked_sampling(last_state, nchunk, nsteps, sample_fn):
-    last_state, tmpout = sample_fn(last_state)
-    if nchunk == 1:
-        return tmpout, last_state
-
+def _do_chunked_sampling(last_state, tmpout, nchunk, nsteps, sample_fn):
     output = _set_tree(
         jax.tree.map(jax.vmap(partial(_gen_arr, nchunk=nchunk)), tmpout),
         jax.device_put(tmpout, jax.devices("cpu")[0]),
@@ -229,14 +225,12 @@ def _do_chunked_sampling(last_state, nchunk, nsteps, sample_fn):
 
     for i in range(1, nchunk):
         last_state, tmpout = sample_fn(last_state)
-
         output = _set_tree(
             output,
             jax.device_put(tmpout, jax.devices("cpu")[0]),
             nsteps * i,
         )
-
-    return output, last_state
+    return last_state, output
 
 
 def _blackjax_inference_loop(seed, init_position, logprob_fn, draws, tune, target_accept, postprocess_fn, map_fn, num_chunks=1, **adaptation_kwargs):
@@ -300,7 +294,11 @@ def _blackjax_inference_loop(seed, init_position, logprob_fn, draws, tune, targe
 
     sample_fn = partial(multi_step, imm=tuned_params["inverse_mass_matrix"], ss=tuned_params["step_size"])
 
-    (all_samples, all_stats), last_state = _do_chunked_sampling((last_state, seed), num_chunks, nsteps, sample_fn)
+    (last_state, seed), (samples, stats) = sample_fn((last_state, seed))
+    if num_chunks == 1:
+        return samples[0], stats, samples[1]
+    
+    last_state, (all_samples, all_stats) = _do_chunked_sampling((last_state, seed), (samples, stats), num_chunks, nsteps, sample_fn)
     return all_samples[0], all_stats, all_samples[1]
 
 
@@ -489,13 +487,11 @@ def _sample_numpyro_nuts(
         map_seed = jax.random.split(map_seed, chains)
 
 
-    last_state = pmap_numpyro.post_warmup_state
-
     #TODO fix random stuff
-    def sample_chunk(last_state):
-        pmap_numpyro.post_warmup_state = last_state
+    def sample_chunk(key):
+        key, _skey = jax.random.split(key)
         pmap_numpyro.run(
-            map_seed,
+            _skey,
             init_params=initial_points,
             extra_fields=(
                 "num_steps",
@@ -512,37 +508,21 @@ def _sample_numpyro_nuts(
             raw_mcmc_samples
         )
         last_state = pmap_numpyro.last_state
-        return last_state, ((mcmc_samples, likelihoods), sample_stats)
+        return (last_state, key), ((mcmc_samples, likelihoods), sample_stats)
     
-    last_state, (samples, stats) = sample_chunk(last_state)
+    def sample_chunk_continue(state):
+        last_state, key = state
+        pmap_numpyro.post_warmup_state = last_state
+        return sample_chunk(key)
+
+    last_state, (samples, stats) = sample_chunk(map_seed)
 
     if nchunk == 1:
         return samples[0], stats, samples[1], numpyro
 
+    last_state, (all_samples, all_stats) = _do_chunked_sampling(last_state, (samples, stats), num_chunks, nsteps, sample_chunk_continue)
+    return all_samples[0], all_stats, all_samples[1], numpyro
 
-
-    # setup + run remaining sample chunks
-    #use_progress_bar = adaptation_kwargs.pop("progress_bar", False)
-    loopiter = range(1, nchunk)
-    #if use_progress_bar:
-    #    loopiter = progress_bar(loopiter)
-
-    output_arrays, output_stats = _set_tree(
-        jax.tree.map(jax.vmap(partial(_gen_arr, nchunk=nchunk)), (samples, stats)), 
-        jax.device_put((samples, stats), jax.devices("cpu")[0]), 
-        0
-    )
-
-    for i in loopiter:
-        last_state, (samples, stats) = sample_chunk(last_state)
-
-        output_arrays, output_stats = _set_tree(
-            (output_arrays, output_stats),
-            jax.device_put((samples, stats), jax.devices("cpu")[0]),
-            nsteps * i,
-        )
-
-    return output_arrays[0], output_stats, output_arrays[1], numpyro
 
 def sample_jax_nuts(
     draws: int = 1000,
