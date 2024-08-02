@@ -171,33 +171,6 @@ def _device_put(input, device: str):
     return jax.device_put(input, jax.devices(device)[0])
 
 
-def _postprocess_samples(
-    jax_fn: Callable,
-    raw_mcmc_samples: list[TensorVariable],
-    postprocessing_backend: Literal["cpu", "gpu"] | None = None,
-    postprocessing_vectorize: Literal["vmap", "scan"] = "vmap",
-    donate_samples: bool = False,
-) -> list[TensorVariable]:
-    if postprocessing_vectorize == "scan":
-        t_raw_mcmc_samples = [jnp.swapaxes(t, 0, 1) for t in raw_mcmc_samples]
-        jax_vfn = jax.vmap(jax_fn)
-        _, outs = scan(
-            lambda _, x: ((), jax_vfn(*x)),
-            (),
-            _device_put(t_raw_mcmc_samples, postprocessing_backend),
-        )
-        return [jnp.swapaxes(t, 0, 1) for t in outs]
-    elif postprocessing_vectorize == "vmap":
-
-        def process_fn(x):
-            return jax.vmap(jax.vmap(jax_fn))(*_device_put(x, postprocessing_backend))
-
-        return jax.jit(process_fn, donate_argnums=0 if donate_samples else None)(raw_mcmc_samples)
-
-    else:
-        raise ValueError(f"Unrecognized postprocessing_vectorize: {postprocessing_vectorize}")
-
-
 def _get_batched_jittered_initial_points(
     model: Model,
     chains: int,
@@ -291,6 +264,8 @@ def _blackjax_inference_loop(seed, init_position, logprob_fn, draws, tune, targe
         **adaptation_kwargs,
     )
 
+    #TODO fix seed
+
     @map_fn
     def run_adaptation(seed, init_position):
         return adapt.run(seed, init_position, num_steps=tune)
@@ -313,7 +288,8 @@ def _blackjax_inference_loop(seed, init_position, logprob_fn, draws, tune, targe
         return state, (position, stats)
 
     @map_fn
-    def multi_step(start_state, key, imm, ss):
+    def multi_step(state, imm, ss):
+        start_state, key = state
         key, _skey = jax.random.split(key)
         keys = jax.random.split(_skey, nsteps)
         last_state, (raw_samples, stats) = jax.lax.scan(
@@ -322,51 +298,11 @@ def _blackjax_inference_loop(seed, init_position, logprob_fn, draws, tune, targe
         samples, log_likelihoods = postprocess_fn(raw_samples)
         return (last_state, key), ((samples, log_likelihoods), stats)
 
-    sample_fn = lambda x: multi_step(*x, imm=tuned_params["inverse_mass_matrix"], ss=tuned_params["step_size"])
+    sample_fn = partial(multi_step, imm=tuned_params["inverse_mass_matrix"], ss=tuned_params["step_size"])
 
-    #keys = jax.vmap(jax.random.split, in_axes=(0, None))(seed, nchunk)
-    key = seed
-
-    (all_samples, all_stats), last_state = _do_chunked_sampling((last_state, key), num_chunks, nsteps, sample_fn)
+    (all_samples, all_stats), last_state = _do_chunked_sampling((last_state, seed), num_chunks, nsteps, sample_fn)
     return all_samples[0], all_stats, all_samples[1]
 
-    #(last_state, key), (samples, stats) = sample_fn((last_state, key))
-
-
-    #if nchunk == 1:
-    #    return samples[0], stats, samples[1]
-
-    #(all_samples, all_stats), last_state = _do_chunked_sampling((last_state, key), (samples, stats), nchunk, nsteps, sample_fn)
-    #return all_samples[0], all_stats, all_samples[1]
-    #(output_arrays[0], output_stats, output_arrays[1])
-
-    # setup + run remaining sample chunks
-    use_progress_bar = adaptation_kwargs.pop("progress_bar", False)
-    loopiter = range(1, nchunk)
-    if use_progress_bar:
-        loopiter = progress_bar(loopiter)
-
-    output_arrays, output_stats = _set_tree(
-        jax.tree.map(jax.vmap(partial(_gen_arr, nchunk=nchunk)), (samples, stats)), 
-        jax.device_put((samples, stats), jax.devices("cpu")[0]), 
-        0
-    )
-
-    for i in loopiter:
-        last_state, (samples, stats) = multi_step(
-            last_state,
-            keys[:, i, :],
-            tuned_params["inverse_mass_matrix"],
-            tuned_params["step_size"],
-        )
-
-        output_arrays, output_stats = _set_tree(
-            (output_arrays, output_stats),
-            jax.device_put((samples, stats), jax.devices("cpu")[0]),
-            nsteps * i,
-        )
-
-    return (output_arrays[0], output_stats, output_arrays[1])
 
 
 def _sample_blackjax_nuts(
