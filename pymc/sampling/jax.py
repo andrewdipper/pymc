@@ -241,7 +241,7 @@ def _sharding_setup(num_chunks, draws, chains, chain_method):
 
     # Setup sharding
     total_devices = len(jax.devices())
-    ndevice = jnp.gcd(chains, total_devices)
+    ndevice = max(jnp.gcd(chains, total_devices), jnp.gcd(chains, min(chains, total_devices)))
     if ndevice < total_devices and ndevice != chains:
         warnings.warn(
             f"Only using {ndevice} devices. GCD of devices={total_devices} and chains={chains} is {ndevice}",
@@ -263,8 +263,8 @@ def _set_tree(store, input, idx):
     store = jax.tree.map(update_fn, store, input)
     return store
 
-@jax.vmap
-def _gen_arr(inp):
+
+def _gen_arr(inp, nchunk):
     shape = (inp.shape[0] * nchunk, *inp.shape[1:])
     return jnp.zeros(shape, dtype=inp.dtype, device=jax.devices("cpu")[0])
 
@@ -352,6 +352,7 @@ def _blackjax_inference_loop(
     if nchunk == 1:
         return samples[0], stats, samples[1]
 
+
     # setup + run remaining sample chunks
     use_progress_bar = adaptation_kwargs.pop("progress_bar", False)
     loopiter = range(1, nchunk)
@@ -359,7 +360,7 @@ def _blackjax_inference_loop(
         loopiter = progress_bar(loopiter)
 
     output_arrays, output_stats = _set_tree(
-        jax.tree.map(_gen_arr, (samples, stats)), 
+        jax.tree.map(jax.vmap(partial(_gen_arr, nchunk=nchunk)), (samples, stats)), 
         jax.device_put((samples, stats), jax.devices("cpu")[0]), 
         0
     )
@@ -535,21 +536,8 @@ def _sample_numpyro_nuts(
     import numpyro
     from numpyro.infer import MCMC, NUTS
 
-    nchunk = num_chunks
-    assert draws % nchunk == 0
-    nsteps = draws // nchunk
+    nchunk, chain_method, ndevice, nsteps = _sharding_setup(num_chunks, draws, chains, chain_method)
 
-    # Setup sharding
-    total_devices = len(jax.devices())
-    ndevice = jnp.gcd(chains, total_devices)
-    if ndevice < total_devices and ndevice != chains:
-        warnings.warn(
-            f"Only using {ndevice} devices. GCD of devices={total_devices} and chains={chains} is {ndevice}",
-            UserWarning,
-        )
-    if ndevice == 1 and chain_method != "vectorized":
-        warnings.warn("Disabling shard_map since devices used=1")
-        chain_method = "vectorized"
 
     logp_fn = get_jaxified_logp(model, negative_logp=False)
 
@@ -578,26 +566,57 @@ def _sample_numpyro_nuts(
         map_seed = jax.random.split(map_seed, chains)
 
 
-    pmap_numpyro.run(
-        map_seed,
-        init_params=initial_points,
-        extra_fields=(
-            "num_steps",
-            "potential_energy",
-            "energy",
-            "adapt_state.step_size",
-            "accept_prob",
-            "diverging",
-        ),
-    )
-    raw_mcmc_samples = pmap_numpyro.get_samples(group_by_chain=True)
-    sample_stats = _numpyro_stats_to_dict(pmap_numpyro)
-    mcmc_samples, likelihoods = jax.jit(jax.vmap(postprocess_fn), donate_argnums=0)(
-        raw_mcmc_samples
+    last_state = pmap_numpyro.post_warmup_state
+
+    def sample_chunk(last_state):
+        pmap_numpyro.post_warmup_state = last_state
+        pmap_numpyro.run(
+            map_seed,
+            init_params=initial_points,
+            extra_fields=(
+                "num_steps",
+                "potential_energy",
+                "energy",
+                "adapt_state.step_size",
+                "accept_prob",
+                "diverging",
+            ),
+        )
+        raw_mcmc_samples = pmap_numpyro.get_samples(group_by_chain=True)
+        sample_stats = _numpyro_stats_to_dict(pmap_numpyro)
+        mcmc_samples, likelihoods = jax.jit(jax.vmap(postprocess_fn), donate_argnums=0)(
+            raw_mcmc_samples
+        )
+        last_state = pmap_numpyro.last_state
+        return last_state, ((mcmc_samples, likelihoods), sample_stats)
+    
+    last_state, (samples, stats) = sample_chunk(last_state)
+
+    if nchunk == 1:
+        return samples[0], stats, samples[1], numpyro
+
+    # setup + run remaining sample chunks
+    #use_progress_bar = adaptation_kwargs.pop("progress_bar", False)
+    loopiter = range(1, nchunk)
+    #if use_progress_bar:
+    #    loopiter = progress_bar(loopiter)
+
+    output_arrays, output_stats = _set_tree(
+        jax.tree.map(jax.vmap(partial(_gen_arr, nchunk=nchunk)), (samples, stats)), 
+        jax.device_put((samples, stats), jax.devices("cpu")[0]), 
+        0
     )
 
-    return mcmc_samples, sample_stats, likelihoods, numpyro
+    for i in loopiter:
+        last_state, (samples, stats) = sample_chunk(last_state)
 
+        output_arrays, output_stats = _set_tree(
+            (output_arrays, output_stats),
+            jax.device_put((samples, stats), jax.devices("cpu")[0]),
+            nsteps * i,
+        )
+
+    return output_arrays[0], output_stats, output_arrays[1], numpyro
 
 def sample_jax_nuts(
     draws: int = 1000,
@@ -769,7 +788,7 @@ def sample_jax_nuts(
         progressbar=progressbar,
         random_seed=random_seed,
         initial_points=initial_points,
-	    postprocess_fn=postprocess_fn,
+        postprocess_fn=postprocess_fn,
         nuts_kwargs=nuts_kwargs,
     )
     tic2 = datetime.now()
