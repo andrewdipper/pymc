@@ -28,7 +28,6 @@ import numpy as np
 import pytensor.tensor as pt
 
 from arviz.data.base import make_attrs
-from blackjax.adaptation.base import get_filter_adapt_info_fn
 from jax.experimental import mesh_utils
 from jax.experimental.shard_map import shard_map
 from jax.sharding import Mesh
@@ -453,6 +452,8 @@ def _sample_blackjax_nuts(
     """
 
     import blackjax
+    from blackjax.adaptation.base import get_filter_adapt_info_fn
+
 
     # Adapted from numpyro
     if chain_method == "parallel":
@@ -577,7 +578,6 @@ def _sample_numpyro_nuts(
         map_seed = jax.random.split(map_seed, chains)
 
 
-
     pmap_numpyro.run(
         map_seed,
         init_params=initial_points,
@@ -595,7 +595,6 @@ def _sample_numpyro_nuts(
     mcmc_samples, likelihoods = jax.jit(jax.vmap(postprocess_fn), donate_argnums=0)(
         raw_mcmc_samples
     )
-
 
     return mcmc_samples, sample_stats, likelihoods, numpyro
 
@@ -734,19 +733,13 @@ def sample_jax_nuts(
     log_likelihood_fn = _get_log_likelihood_fn(model)
     transform_jax_fn = get_jaxified_graph(inputs=model.value_vars, outputs=vars_to_sample)
 
-    def postprocess_base_fn(samples, transform, likelihood):
+    def postprocess_fn(samples):
         mcmc_samples, likelihoods = None, None
-        if likelihood:
+        if idata_kwargs.pop("log_likelihood", False):
             likelihoods = log_likelihood_fn(samples)
-        if transform:
-            result = jax.vmap(transform_jax_fn)(*samples)
-            mcmc_samples = {v.name: r for v, r in zip(vars_to_sample, result)}
+        result = jax.vmap(transform_jax_fn)(*samples)
+        mcmc_samples = {v.name: r for v, r in zip(vars_to_sample, result)}
         return mcmc_samples, likelihoods
-
-    postprocess_fn = partial(
-        postprocess_base_fn, transform=True, likelihood=idata_kwargs.pop("log_likelihood", False)
-    )
-
 
     (random_seed,) = _get_seeds_per_chain(random_seed, 1)
 
