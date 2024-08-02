@@ -243,10 +243,32 @@ def _gen_arr(inp, nchunk):
     return jnp.zeros(shape, dtype=inp.dtype, device=jax.devices("cpu")[0])
 
 
+def _do_chunked_sampling(last_state, nchunk, nsteps, sample_fn):
+    last_state, tmpout = sample_fn(last_state)
+    if nchunk == 1:
+        return tmpout, last_state
+
+    output = _set_tree(
+        jax.tree.map(jax.vmap(partial(_gen_arr, nchunk=nchunk)), tmpout),
+        jax.device_put(tmpout, jax.devices("cpu")[0]),
+        0
+    )
+
+    for i in range(1, nchunk):
+        last_state, tmpout = sample_fn(last_state)
+
+        output = _set_tree(
+            output,
+            jax.device_put(tmpout, jax.devices("cpu")[0]),
+            nsteps * i,
+        )
+
+    return output, last_state
+
+
 def _blackjax_inference_loop(seed, init_position, logprob_fn, draws, tune, target_accept, postprocess_fn, map_fn, num_chunks=1, **adaptation_kwargs):
     import blackjax
     from blackjax.adaptation.base import get_filter_adapt_info_fn
-    from fastprogress.fastprogress import progress_bar
 
     algorithm_name = adaptation_kwargs.pop("algorithm", "nuts")
     if algorithm_name == "nuts":
@@ -256,9 +278,8 @@ def _blackjax_inference_loop(seed, init_position, logprob_fn, draws, tune, targe
     else:
         raise ValueError("Only supporting 'nuts' or 'hmc' as algorithm to draw samples.")
 
-    nchunk = num_chunks
-    assert draws % nchunk == 0
-    nsteps = draws // nchunk
+    assert draws % num_chunks == 0
+    nsteps = draws // num_chunks
 
 
     # Run adaptation
@@ -293,20 +314,31 @@ def _blackjax_inference_loop(seed, init_position, logprob_fn, draws, tune, targe
 
     @map_fn
     def multi_step(start_state, key, imm, ss):
-        keys = jax.random.split(key, nsteps)
+        key, _skey = jax.random.split(key)
+        keys = jax.random.split(_skey, nsteps)
         last_state, (raw_samples, stats) = jax.lax.scan(
             partial(_one_step, imm=imm, ss=ss), start_state, keys
         )
         samples, log_likelihoods = postprocess_fn(raw_samples)
-        return last_state, ((samples, log_likelihoods), stats)
+        return (last_state, key), ((samples, log_likelihoods), stats)
 
-    keys = jax.vmap(jax.random.split, in_axes=(0, None))(seed, nchunk)
-    last_state, (samples, stats) = multi_step(
-        last_state, keys[:, 0, :], tuned_params["inverse_mass_matrix"], tuned_params["step_size"]
-    )
+    sample_fn = lambda x: multi_step(*x, imm=tuned_params["inverse_mass_matrix"], ss=tuned_params["step_size"])
 
-    if nchunk == 1:
-        return samples[0], stats, samples[1]
+    #keys = jax.vmap(jax.random.split, in_axes=(0, None))(seed, nchunk)
+    key = seed
+
+    (all_samples, all_stats), last_state = _do_chunked_sampling((last_state, key), num_chunks, nsteps, sample_fn)
+    return all_samples[0], all_stats, all_samples[1]
+
+    #(last_state, key), (samples, stats) = sample_fn((last_state, key))
+
+
+    #if nchunk == 1:
+    #    return samples[0], stats, samples[1]
+
+    #(all_samples, all_stats), last_state = _do_chunked_sampling((last_state, key), (samples, stats), nchunk, nsteps, sample_fn)
+    #return all_samples[0], all_stats, all_samples[1]
+    #(output_arrays[0], output_stats, output_arrays[1])
 
     # setup + run remaining sample chunks
     use_progress_bar = adaptation_kwargs.pop("progress_bar", False)
@@ -523,6 +555,7 @@ def _sample_numpyro_nuts(
 
     last_state = pmap_numpyro.post_warmup_state
 
+    #TODO fix random stuff
     def sample_chunk(last_state):
         pmap_numpyro.post_warmup_state = last_state
         pmap_numpyro.run(
@@ -549,6 +582,8 @@ def _sample_numpyro_nuts(
 
     if nchunk == 1:
         return samples[0], stats, samples[1], numpyro
+
+
 
     # setup + run remaining sample chunks
     #use_progress_bar = adaptation_kwargs.pop("progress_bar", False)
