@@ -14,7 +14,6 @@
 import logging
 import os
 import re
-import warnings
 
 from collections.abc import Callable, Sequence
 from datetime import datetime
@@ -229,27 +228,6 @@ def _get_batched_jittered_initial_points(
     return [np.stack(init_state) for init_state in zip(*initial_points_values)]
 
 
-
-def _sharding_setup(num_chunks, draws, chains, chain_method):
-    nchunk = num_chunks
-    assert draws % nchunk == 0
-    nsteps = draws // nchunk
-
-    # Setup sharding
-    total_devices = len(jax.devices())
-    ndevice = max(jnp.gcd(chains, total_devices), jnp.gcd(chains, min(chains, total_devices)))
-    if ndevice < total_devices and ndevice != chains:
-        warnings.warn(
-            f"Only using {ndevice} devices. GCD of devices={total_devices} and chains={chains} is {ndevice}",
-            UserWarning,
-        )
-    if ndevice == 1 and chain_method != "vectorized":
-        warnings.warn("Disabling shard_map since devices used=1")
-        chain_method = "vectorized"
-
-    return nchunk, chain_method, ndevice, nsteps
-
-
 @partial(jax.jit, donate_argnums=0)
 def _set_tree(store, input, idx):
     def update_fn(sarr, iarr):
@@ -265,19 +243,7 @@ def _gen_arr(inp, nchunk):
     return jnp.zeros(shape, dtype=inp.dtype, device=jax.devices("cpu")[0])
 
 
-def _blackjax_inference_loop(
-    seed,
-    init_position,
-    logprob_fn,
-    draws,
-    tune,
-    target_accept,
-    postprocess_fn,
-    chains,
-    chain_method,
-    num_chunks=1,
-    **adaptation_kwargs,
-):
+def _blackjax_inference_loop(seed, init_position, logprob_fn, draws, tune, target_accept, postprocess_fn, map_fn, num_chunks=1, **adaptation_kwargs):
     import blackjax
     from blackjax.adaptation.base import get_filter_adapt_info_fn
     from fastprogress.fastprogress import progress_bar
@@ -290,12 +256,10 @@ def _blackjax_inference_loop(
     else:
         raise ValueError("Only supporting 'nuts' or 'hmc' as algorithm to draw samples.")
 
-    nchunk, chain_method, ndevice, nsteps = _sharding_setup(num_chunks, draws, chains, chain_method)
-    devices = mesh_utils.create_device_mesh((ndevice,), devices=jax.devices()[:ndevice])
-    mesh = Mesh(devices, axis_names=("C"))
-    shard_wrap_fn = partial(shard_map, mesh=mesh, out_specs=(PS("C"), PS("C")), check_rep=False)
-    def shardswitch(wrapper):
-        return lambda fn: fn if chain_method == "vectorized" else wrapper(fn)
+    nchunk = num_chunks
+    assert draws % nchunk == 0
+    nsteps = draws // nchunk
+
 
     # Run adaptation
     adapt = blackjax.window_adaptation(
@@ -307,8 +271,7 @@ def _blackjax_inference_loop(
     )
 
     @jax.jit
-    @shardswitch(partial(shard_wrap_fn, in_specs=(PS("C"), PS("C"))))
-    @jax.vmap
+    @map_fn
     def run_adaptation(seed, init_position):
         return adapt.run(seed, init_position, num_steps=tune)
     (last_state, tuned_params), _ = run_adaptation(seed, init_position)
@@ -330,8 +293,7 @@ def _blackjax_inference_loop(
         return state, (position, stats)
 
     @jax.jit
-    @shardswitch(partial(shard_wrap_fn, in_specs=(PS("C"), PS("C"), PS("C"), PS("C"))))
-    @jax.vmap
+    @map_fn
     def multi_step(start_state, key, imm, ss):
         keys = jax.random.split(key, nsteps)
         last_state, (raw_samples, stats) = jax.lax.scan(
@@ -449,8 +411,6 @@ def _sample_blackjax_nuts(
     """
 
     import blackjax
-    from blackjax.adaptation.base import get_filter_adapt_info_fn
-
 
     # Adapted from numpyro
     if chain_method == "parallel":
@@ -485,9 +445,8 @@ def _sample_blackjax_nuts(
         tune=tune,
         draws=draws,
         target_accept=target_accept,
-        chains=chains,
-        chain_method=chain_method,
         postprocess_fn=postprocess_fn,
+        map_fn=map_fn,
         **nuts_kwargs,
     )
 
@@ -532,8 +491,9 @@ def _sample_numpyro_nuts(
     import numpyro
     from numpyro.infer import MCMC, NUTS
 
-    nchunk, chain_method, ndevice, nsteps = _sharding_setup(num_chunks, draws, chains, chain_method)
-
+    nchunk = num_chunks
+    assert draws % nchunk == 0
+    nsteps = draws // nchunk
 
     logp_fn = get_jaxified_logp(model, negative_logp=False)
 
