@@ -28,10 +28,6 @@ import numpy as np
 import pytensor.tensor as pt
 
 from arviz.data.base import make_attrs
-from jax.experimental import mesh_utils
-from jax.experimental.shard_map import shard_map
-from jax.sharding import Mesh
-from jax.sharding import PartitionSpec as PS
 from pytensor.compile import SharedVariable, Supervisor, mode
 from pytensor.graph.basic import graph_inputs
 from pytensor.graph.fg import FunctionGraph
