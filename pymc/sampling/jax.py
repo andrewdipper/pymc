@@ -270,7 +270,6 @@ def _blackjax_inference_loop(seed, init_position, logprob_fn, draws, tune, targe
         **adaptation_kwargs,
     )
 
-    @jax.jit
     @map_fn
     def run_adaptation(seed, init_position):
         return adapt.run(seed, init_position, num_steps=tune)
@@ -292,7 +291,6 @@ def _blackjax_inference_loop(seed, init_position, logprob_fn, draws, tune, targe
         }
         return state, (position, stats)
 
-    @jax.jit
     @map_fn
     def multi_step(start_state, key, imm, ss):
         keys = jax.random.split(key, nsteps)
@@ -309,7 +307,6 @@ def _blackjax_inference_loop(seed, init_position, logprob_fn, draws, tune, targe
 
     if nchunk == 1:
         return samples[0], stats, samples[1]
-
 
     # setup + run remaining sample chunks
     use_progress_bar = adaptation_kwargs.pop("progress_bar", False)
@@ -352,6 +349,7 @@ def _sample_blackjax_nuts(
     initial_points,
     postprocess_fn,
     nuts_kwargs,
+    num_chunks: int = 1,
 ) -> az.InferenceData:
     """
     Draw samples from the posterior using the NUTS method from the ``blackjax`` library.
@@ -424,7 +422,7 @@ def _sample_blackjax_nuts(
             )
             progressbar = False
     elif chain_method == "vectorized":
-        map_fn = jax.vmap
+        map_fn = lambda x: jax.jit(jax.vmap(x))
     else:
         raise ValueError(
             "Only supporting the following methods to draw chains:" ' "parallel" or "vectorized"'
@@ -447,6 +445,7 @@ def _sample_blackjax_nuts(
         target_accept=target_accept,
         postprocess_fn=postprocess_fn,
         map_fn=map_fn,
+        num_chunks=num_chunks,
         **nuts_kwargs,
     )
 
@@ -595,6 +594,7 @@ def sample_jax_nuts(
     idata_kwargs: dict | None = None,
     compute_convergence_checks: bool = True,
     nuts_sampler: Literal["numpyro", "blackjax"],
+    num_chunks: int = 1,
 ) -> az.InferenceData:
     """
     Draw samples from the posterior using a jax NUTS method.
@@ -676,7 +676,7 @@ def sample_jax_nuts(
         import warnings
 
         warnings.warn(
-            "postprocessing_backend will be removed in a future release, "
+            "postprocessing_backend={'cpu', 'gpu'} will be removed in a future release, "
             "postprocessing is done on sampling device.",
             DeprecationWarning,
         )
@@ -746,6 +746,7 @@ def sample_jax_nuts(
         initial_points=initial_points,
         postprocess_fn=postprocess_fn,
         nuts_kwargs=nuts_kwargs,
+        num_chunks=num_chunks,
     )
     tic2 = datetime.now()
 
