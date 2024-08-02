@@ -234,6 +234,42 @@ def _get_batched_jittered_initial_points(
     return [np.stack(init_state) for init_state in zip(*initial_points_values)]
 
 
+
+def _sharding_setup(num_chunks, draws, chains, chain_method):
+    nchunk = num_chunks
+    assert draws % nchunk == 0
+    nsteps = draws // nchunk
+
+    # Setup sharding
+    total_devices = len(jax.devices())
+    ndevice = jnp.gcd(chains, total_devices)
+    if ndevice < total_devices and ndevice != chains:
+        warnings.warn(
+            f"Only using {ndevice} devices. GCD of devices={total_devices} and chains={chains} is {ndevice}",
+            UserWarning,
+        )
+    if ndevice == 1 and chain_method != "vectorized":
+        warnings.warn("Disabling shard_map since devices used=1")
+        chain_method = "vectorized"
+
+    return nchunk, chain_method, ndevice, nsteps
+
+
+@partial(jax.jit, donate_argnums=0)
+def _set_tree(store, input, idx):
+    def update_fn(sarr, iarr):
+        starts = (idx, *([0] * (len(sarr.shape) - 1)))
+        return jax.lax.dynamic_update_slice(sarr, iarr, starts)
+
+    store = jax.tree.map(update_fn, store, input)
+    return store
+
+@jax.vmap
+def _gen_arr(inp):
+    shape = (inp.shape[0] * nchunk, *inp.shape[1:])
+    return jnp.zeros(shape, dtype=inp.dtype, device=jax.devices("cpu")[0])
+
+
 def _blackjax_inference_loop(
     seed,
     init_position,
@@ -248,13 +284,8 @@ def _blackjax_inference_loop(
     **adaptation_kwargs,
 ):
     import blackjax
-    from fastprogress.fastprogress import progress_bar
-
-    nchunk = num_chunks
-    assert draws % nchunk == 0
-    nsteps = draws // nchunk
-
     from blackjax.adaptation.base import get_filter_adapt_info_fn
+    from fastprogress.fastprogress import progress_bar
 
     algorithm_name = adaptation_kwargs.pop("algorithm", "nuts")
     if algorithm_name == "nuts":
@@ -264,29 +295,12 @@ def _blackjax_inference_loop(
     else:
         raise ValueError("Only supporting 'nuts' or 'hmc' as algorithm to draw samples.")
 
-    # Setup sharding
-    total_devices = len(jax.devices())
-    ndevice = jnp.gcd(chains, total_devices)
-    if ndevice < total_devices and ndevice != chains:
-        warnings.warn(
-            f"Only using {ndevice} devices. GCD of devices={total_devices} and chains={chains} is {ndevice}",
-            UserWarning,
-        )
-    print(f'using {ndevice} of {total_devices} devices')
-    if ndevice == 1 and chain_method != "vectorized":
-        warnings.warn("Disabling shard_map since devices used=1")
-        chain_method = "vectorized"
-
-    def shardswitch(wrapper):
-        def decorator(fn):
-            if chain_method != "vectorized":
-                return wrapper(fn)
-            return fn
-
-        return decorator
-
+    nchunk, chain_method, ndevice, nsteps = _sharding_setup(num_chunks, draws, chains, chain_method)
     devices = mesh_utils.create_device_mesh((ndevice,), devices=jax.devices()[:ndevice])
     mesh = Mesh(devices, axis_names=("C"))
+    shard_wrap_fn = partial(shard_map, mesh=mesh, out_specs=(PS("C"), PS("C")), check_rep=False)
+    def shardswitch(chain_method, wrapper):
+        return lambda fn: fn if chain_method == "vectorized" else wrapper(fn)
 
     # Run adaptation
     adapt = blackjax.window_adaptation(
@@ -298,21 +312,14 @@ def _blackjax_inference_loop(
     )
 
     @jax.jit
-    @shardswitch(
-        partial(
-            shard_map,
-            mesh=mesh,
-            in_specs=(PS("C"), PS("C")),
-            out_specs=(PS("C"), PS("C")),
-            check_rep=False,
-        )
-    )
+    @shardswitch(chain_method, partial(shard_wrap_fn, in_specs=(PS("C"), PS("C"))))
     @jax.vmap
     def run_adaptation(seed, init_position):
         return adapt.run(seed, init_position, num_steps=tune)
     (last_state, tuned_params), _ = run_adaptation(seed, init_position)
 
     # Setup + run first sample chunk
+    @jax.vmap
     def _one_step(state, rng_key, imm, ss):
         state, info = algorithm(logprob_fn, inverse_mass_matrix=imm, step_size=ss).step(
             rng_key, state
@@ -329,22 +336,14 @@ def _blackjax_inference_loop(
         return state, (position, stats)
 
     @jax.jit
-    @shardswitch(
-        partial(
-            shard_map,
-            mesh=mesh,
-            in_specs=(PS("C"), PS("C"), PS("C"), PS("C")),
-            out_specs=(PS("C"), PS("C")),
-            check_rep=False,
-        )
-    )
+    @shardswitch(chain_method, partial(shard_wrap_fn, in_specs=(PS("C"), PS("C"), PS("C"), PS("C"))))
     @jax.vmap
     def multi_step(start_state, key, imm, ss):
-        keys = jax.random.split(key, nsteps)
+        keys = jax.vmap(jax.random.split, in_axes=(0, None))(key, nsteps)
         last_state, (raw_samples, stats) = jax.lax.scan(
             partial(_one_step, imm=imm, ss=ss), start_state, keys
         )
-        samples, log_likelihoods = postprocess_fn(raw_samples)
+        samples, log_likelihoods = jax.vmap(postprocess_fn)(raw_samples)
         return last_state, ((samples, log_likelihoods), stats)
 
     keys = jax.vmap(jax.random.split, in_axes=(0, None))(seed, nchunk)
@@ -361,25 +360,10 @@ def _blackjax_inference_loop(
     if use_progress_bar:
         loopiter = progress_bar(loopiter)
 
-    @partial(jax.jit, donate_argnums=0)
-    def set_tree(store, input, idx):
-        def update_fn(sarr, iarr):
-            starts = (idx, *([0] * (len(sarr.shape) - 1)))
-            return jax.lax.dynamic_update_slice(sarr, iarr, starts)
-
-        store = jax.tree.map(update_fn, store, input)
-        return store
-
-    @jax.vmap
-    def gen_arr(inp):
-        shape = (inp.shape[0] * nchunk, *inp.shape[1:])
-        return jnp.zeros(shape, dtype=inp.dtype, device=jax.devices("cpu")[0])
-
-    output_arrays = set_tree(
-        jax.tree.map(gen_arr, samples), jax.device_put(samples, jax.devices("cpu")[0]), 0
-    )
-    output_stats = set_tree(
-        jax.tree.map(gen_arr, stats), jax.device_put(stats, jax.devices("cpu")[0]), 0
+    output_arrays, output_stats = _set_tree(
+        jax.tree.map(_gen_arr, (samples, stats)), 
+        jax.device_put((samples, stats), jax.devices("cpu")[0]), 
+        0
     )
 
     for i in loopiter:
@@ -389,11 +373,11 @@ def _blackjax_inference_loop(
             tuned_params["inverse_mass_matrix"],
             tuned_params["step_size"],
         )
-        output_arrays = set_tree(
-            output_arrays, jax.device_put(samples, jax.devices("cpu")[0]), nsteps * i
-        )
-        output_stats = set_tree(
-            output_stats, jax.device_put(stats, jax.devices("cpu")[0]), nsteps * i
+
+        output_arrays, output_stats = _set_tree(
+            (output_arrays, output_stats),
+            jax.device_put((samples, stats), jax.devices("cpu")[0]),
+            nsteps * i,
         )
 
     return (output_arrays[0], output_stats, output_arrays[1])
@@ -593,6 +577,8 @@ def _sample_numpyro_nuts(
     if chains > 1:
         map_seed = jax.random.split(map_seed, chains)
 
+
+
     pmap_numpyro.run(
         map_seed,
         init_params=initial_points,
@@ -605,12 +591,13 @@ def _sample_numpyro_nuts(
             "diverging",
         ),
     )
-
     raw_mcmc_samples = pmap_numpyro.get_samples(group_by_chain=True)
     sample_stats = _numpyro_stats_to_dict(pmap_numpyro)
     mcmc_samples, likelihoods = jax.jit(jax.vmap(postprocess_fn), donate_argnums=0)(
         raw_mcmc_samples
     )
+
+
     return mcmc_samples, sample_stats, likelihoods, numpyro
 
 
