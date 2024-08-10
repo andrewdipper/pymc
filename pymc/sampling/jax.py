@@ -167,10 +167,6 @@ def _get_log_likelihood_fn(model: Model) -> Callable:
     return log_likelihood_fn
 
 
-def _device_put(input, device: str):
-    return jax.device_put(input, jax.devices(device)[0])
-
-
 def _get_batched_jittered_initial_points(
     model: Model,
     chains: int,
@@ -203,9 +199,9 @@ def _get_batched_jittered_initial_points(
 
 @partial(jax.jit, donate_argnums=0)
 def _set_tree(store, input, idx):
-    def update_fn(sarr, iarr):
-        starts = (idx, *([0] * (len(sarr.shape) - 1)))
-        return jax.lax.dynamic_update_slice(sarr, iarr, starts)
+    def update_fn(save, inp):
+        starts = (idx, *([0] * (len(save.shape) - 1)))
+        return jax.lax.dynamic_update_slice(save, inp, starts)
 
     store = jax.tree.map(update_fn, store, input)
     return store
@@ -285,7 +281,6 @@ def _sample_blackjax_nuts(
     assert draws % num_chunks == 0
     nsteps = draws // num_chunks
 
-
     # Run adaptation
     adapt = blackjax.window_adaptation(
         algorithm=algorithm,
@@ -302,9 +297,6 @@ def _sample_blackjax_nuts(
     (last_state, tuned_params), _ = run_adaptation(adapt_seed, initial_points)
     del adapt_seed
 
-
-
-    # Setup + run first sample chunk
     def _one_step(state, x, imm, ss):
         _, rng_key = x
         state, info = algorithm(logprob_fn, inverse_mass_matrix=imm, step_size=ss).step(
