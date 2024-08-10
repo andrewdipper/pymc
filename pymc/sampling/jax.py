@@ -249,62 +249,6 @@ def _sample_blackjax_nuts(
     nuts_kwargs,
     num_chunks: int = 1,
 ) -> az.InferenceData:
-    """
-    Draw samples from the posterior using the NUTS method from the ``blackjax`` library.
-
-    Parameters
-    ----------
-    draws : int, default 1000
-        The number of samples to draw. The number of tuned samples are discarded by
-        default.
-    tune : int, default 1000
-        Number of iterations to tune. Samplers adjust the step sizes, scalings or
-        similar during tuning. Tuning samples will be drawn in addition to the number
-        specified in the ``draws`` argument.
-    chains : int, default 4
-        The number of chains to sample.
-    target_accept : float in [0, 1].
-        The step size is tuned such that we approximate this acceptance rate. Higher
-        values like 0.9 or 0.95 often work better for problematic posteriors.
-    random_seed : int, RandomState or Generator, optional
-        Random seed used by the sampling steps.
-    initvals: StartDict or Sequence[Optional[StartDict]], optional
-        Initial values for random variables provided as a dictionary (or sequence of
-        dictionaries) mapping the random variable (by name or reference) to desired
-        starting values.
-    jitter: bool, default True
-        If True, add jitter to initial points.
-    model : Model, optional
-        Model to sample from. The model needs to have free random variables. When inside
-        a ``with`` model context, it defaults to that model, otherwise the model must be
-        passed explicitly.
-    var_names : sequence of str, optional
-        Names of variables for which to compute the posterior samples. Defaults to all
-        variables in the posterior.
-    keep_untransformed : bool, default False
-        Include untransformed variables in the posterior samples. Defaults to False.
-    chain_method : str, default "parallel"
-        Specify how samples should be drawn. The choices include "parallel", and
-        "vectorized".
-    postprocessing_backend: Optional[Literal["cpu", "gpu"]], default None,
-        Specify how postprocessing should be computed. gpu or cpu
-    postprocessing_vectorize: Literal["vmap", "scan"], default "scan"
-        How to vectorize the postprocessing: vmap or sequential scan
-    idata_kwargs : dict, optional
-        Keyword arguments for :func:`arviz.from_dict`. It also accepts a boolean as
-        value for the ``log_likelihood`` key to indicate that the pointwise log
-        likelihood should not be included in the returned object. Values for
-        ``observed_data``, ``constant_data``, ``coords``, and ``dims`` are inferred from
-        the ``model`` argument if not provided in ``idata_kwargs``. If ``coords`` and
-        ``dims`` are provided, they are used to update the inferred dictionaries.
-
-    Returns
-    -------
-    InferenceData
-        ArviZ ``InferenceData`` object that contains the posterior samples, together
-        with their respective sample stats and pointwise log likeihood values (unless
-        skipped with ``idata_kwargs``).
-    """
 
     import blackjax
     from blackjax.adaptation.base import get_filter_adapt_info_fn
