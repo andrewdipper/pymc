@@ -289,6 +289,7 @@ def _sample_blackjax_nuts(
             progress_bar=progressbar,
             **nuts_kwargs,
         ).run(seed, init_position, num_steps=tune)
+
     (adapt_state, tuned_params), _ = run_adaptation(adapt_seed, initial_points)
 
     # Filters output from each sampling step
@@ -325,7 +326,6 @@ def _sample_blackjax_nuts(
     chunk_sample_fn = partial(
         _multi_step, imm=tuned_params["inverse_mass_matrix"], ss=tuned_params["step_size"]
     )
-
 
     if progressbar:
         logger.info("Sampling chunk %d of %d:" % (1, num_chunks))

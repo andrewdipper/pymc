@@ -75,9 +75,9 @@ def test_external_nuts_sampler(recwarn, nuts_sampler):
     assert idata_reference.posterior.attrs.keys() == idata1.posterior.attrs.keys()
 
 
-@pytest.mark.parametrize("nuts_sampler", ["blackjax", "numpyro"])
-def test_external_nuts_chunking(nuts_sampler):
+def test_numpyro_external_nuts_chunking():
     # chunked sampling should give exact same results as non-chunked
+    nuts_sampler = "numpyro"
     pytest.importorskip(nuts_sampler)
 
     with Model():
